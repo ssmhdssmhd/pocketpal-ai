@@ -71,7 +71,7 @@ describe('PlusDrawerItem', () => {
     const {queryByTestId} = renderItem();
     expect(queryByTestId('drawer-item-plus')).toBeNull();
 
-    act(() => setShipOverride(['localApiServer']));
+    act(() => setShipOverride(['handsFreeVoice']));
 
     expect(queryByTestId('drawer-item-plus')).not.toBeNull();
   });

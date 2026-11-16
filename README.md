@@ -29,6 +29,16 @@ Chat with language models, give them a voice, and let them use tools — all on-
 
 ---
 
+## 当前维护版本
+
+### PocketPal.AI.1.23.1 202611170120
+
+- **Settings → Local API server → Serve the loaded model** 已取消 PocketPal Plus 付费要求，可直接启动；其他 Plus 功能保持不变。
+- 在 GitHub 仓库选择 **Actions → Android APK → Run workflow**，即可从 `main` 分支云端构建签名 APK。
+- 构建产物名为 `PocketPal.AI.1.23.1.apk`，同时发布到 Actions Artifacts 和 GitHub Releases，并附 SHA-256 校验文件。
+- 固定签名文件及密码只保存在 GitHub Secrets：`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_PASSWORD`，不提交到仓库。
+- 完整更新记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## Why PocketPal AI?
 
 Most AI apps are a thin window onto someone else's server — every message you type gets shipped off, logged, and analyzed somewhere you can't see. PocketPal flips that around: **the AI lives on your phone, and your conversations stay on it unless you choose an online feature.**
@@ -36,7 +46,7 @@ Most AI apps are a thin window onto someone else's server — every message you 
 - **🔒 Private by default** — every prompt, response, and document stays on your device unless you turn on an online feature such as web search or a remote server.
 - **✈️ Works offline** — download a model once and it just works, with no connection and no account. On a plane, on a trail, anywhere.
 - **📱 Runs on hardware you already own** — real language models, voices, and tools, tuned to make the most of your phone's CPU, GPU, and NPU.
-- **🆓 Free and open source** — chat, models, voices and tools are free, with no account. The App Store and Google Play builds offer an optional one-time **PocketPal Plus** purchase for hands-free voice and the local API server; builds from source include it, and so does the APK on GitHub Releases from the release after v1.23.0. MIT-licensed.
+- **🆓 Free and open source** — chat, models, voices, tools and the local API server are free, with no account. The App Store and Google Play builds offer an optional one-time **PocketPal Plus** purchase for hands-free voice; builds from source also include it. MIT-licensed.
 
 > **Privacy note:** Your chats and documents leave your device only through features you turn on: web search and page reading, a remote server, or a system voice your phone runs online. The app's other network use (model and voice downloads, PalsHub and purchases, device-compatibility rules from the jsDelivr CDN at launch, the opt-in benchmark leaderboard, and feedback or reports you submit) never attaches your chats.
 
@@ -59,7 +69,7 @@ Most AI apps are a thin window onto someone else's server — every message you 
 - **🎙️ Voice input** — dictate messages with on-device Whisper speech recognition (whisper.cpp).
 - **🎭 Pals** — create personalized assistants with their own model, system prompt, and personality (Assistant and Roleplay types).
 - **🛍️ [PalsHub](https://palshub.ai/)** — discover and install community Pals, including premium ones via in-app purchase.
-- **✨ PocketPal Plus** — an optional one-time purchase in the App Store and Google Play builds that adds hands-free voice conversation and a local API server. Builds from source, and the APK on GitHub Releases from the release after v1.23.0, include every Plus feature with no purchase.
+- **✨ PocketPal Plus** — an optional one-time purchase in the App Store and Google Play builds that adds hands-free voice conversation. The local API server is free in every build; builds from source also include hands-free voice with no purchase.
 - **🛠️ Talents & tools** — let capable Pals call built-in tools (calculator, date/time, rich HTML rendering, opt-in web search and page reading) inside a tool-use loop.
 - **📥 Hugging Face integration** — search and download GGUF models, including gated ones, directly from the HF Hub with your access token.
 - **📊 Benchmarking** — measure tokens/sec and memory, and optionally compare on the [AI Phone Leaderboard](https://pocketpal.dev/leaderboard).

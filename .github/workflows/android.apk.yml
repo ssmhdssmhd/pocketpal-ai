@@ -1,0 +1,196 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ORG_GRADLE_PROJECT_rnllamaBuildFromSource: 'true'
+      RNLLAMA_SKIP_POSTINSTALL: '1'
+      PLUS_STORE_GATE: 'true'
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Maximize build space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          df -h /
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.21.0
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Restore enriched-markdown native assets
+        run: INIT_CWD="$GITHUB_WORKSPACE" node node_modules/react-native-enriched-markdown/postinstall.mjs
+
+      - name: Derive the rnllama variant allowlist
+        run: |
+          set -euo pipefail
+          VARIANTS=$(node scripts/verify-android-payload.js --print-variants)
+          echo "Declared allowlist: $VARIANTS"
+          echo "ORG_GRADLE_PROJECT_rnllamaVariants=$VARIANTS" >> "$GITHUB_ENV"
+
+      - name: Cache llama.rn native build tree
+        uses: actions/cache@v4
+        with:
+          path: node_modules/llama.rn/android/.cxx
+          key: ${{ runner.os }}-cxx-${{ hashFiles('yarn.lock', 'patches/**', 'scripts/android-payload-manifest.json') }}
+
+      - name: Set up the Hexagon SDK
+        uses: ./.github/actions/setup-hexagon-sdk
+
+      - name: Set up ccache
+        uses: ./.github/actions/setup-ccache
+
+      - name: Create CI google-services.json
+        run: |
+          cat > android/app/google-services.json << 'EOL'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "dummy-project-for-apk",
+              "storage_bucket": "dummy-project-for-apk.appspot.com"
+            },
+            "client": [{
+              "client_info": {
+                "mobilesdk_app_id": "1:000000000000:android:0000000000000000",
+                "android_client_info": {
+                  "package_name": "com.pocketpalai"
+                }
+              },
+              "api_key": [{
+                "current_key": "dummy-api-key-for-apk-builds"
+              }]
+            }]
+          }
+          EOL
+
+      - name: Create CI .env
+        run: |
+          cat > .env << 'EOL'
+          FIREBASE_FUNCTIONS_URL=https://dummy-firebase-url.com
+          SUPABASE_URL=https://dummy-supabase-url.supabase.co
+          SUPABASE_ANON_KEY=dummy-anon-key-for-apk-builds
+          PALSHUB_API_BASE_URL=https://dummy-palshub-api.com
+          APP_URL=pocketpal://app
+          ENABLE_PALSHUB_INTEGRATION=true
+          ENABLE_AUTHENTICATION=true
+          ENABLE_OFFLINE_MODE=true
+          GOOGLE_IOS_CLIENT_ID=dummy-ios-client-id.apps.googleusercontent.com
+          GOOGLE_WEB_CLIENT_ID=dummy-web-client-id.apps.googleusercontent.com
+          EOL
+
+      - name: Restore the fixed release keystore
+        working-directory: android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 is required."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > app/pocketpal-release-key.keystore
+          chmod 600 app/pocketpal-release-key.keystore
+
+      - name: Build Android release APK
+        working-directory: android
+        env:
+          APP_RELEASE_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          APP_RELEASE_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          GRADLE_USER_HOME: ${{ runner.temp }}/.gradle
+        run: |
+          set -euo pipefail
+          if [ -z "${APP_RELEASE_STORE_PASSWORD:-}" ] || [ -z "${APP_RELEASE_KEY_PASSWORD:-}" ]; then
+            echo "::error::Both release signing password secrets are required."
+            exit 1
+          fi
+          if [ "${ORG_GRADLE_PROJECT_rnllamaBuildFromSource:-}" != "true" ]; then
+            echo "::error::ORG_GRADLE_PROJECT_rnllamaBuildFromSource must be true."
+            exit 1
+          fi
+          ./gradlew assembleProdRelease 2>&1 | tee android-build.log
+
+      - name: Show ccache statistics
+        if: always()
+        run: ccache --show-stats || echo "ccache unavailable"
+
+      - name: Verify the variant allowlist reached llama.rn
+        run: |
+          set -euo pipefail
+          VARIANTS=$(node scripts/verify-android-payload.js --print-variants)
+          grep -qF "Building rnllama variants: $VARIANTS" android/android-build.log
+
+      - name: Verify the Android payload
+        run: |
+          node scripts/verify-android-payload.js \
+            --apk android/app/build/outputs/apk/prod/release/app-prod-release.apk \
+            --report payload-report.txt
+
+      - name: Verify the Plus store gate
+        run: scripts/verify-plus-gate.sh android/app/build/outputs/apk/prod/release/app-prod-release.apk --gated
+
+      - name: Package and verify the APK
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION=$(tr -d '[:space:]' < .version)
+          APK_NAME="PocketPal.AI.${VERSION}.apk"
+          cp android/app/build/outputs/apk/prod/release/app-prod-release.apk "$APK_NAME"
+          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --print-certs "$APK_NAME"
+          sha256sum "$APK_NAME" > "$APK_NAME.sha256"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=PocketPal.AI.$VERSION" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload payload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketPal.AI.payload
+          path: payload-report.txt
+          if-no-files-found: ignore
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            ${{ steps.package.outputs.apk_name }}
+            ${{ steps.package.outputs.apk_name }}.sha256
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.package.outputs.version }}
+          name: PocketPal.AI.${{ steps.package.outputs.version }}
+          body: |
+            Local API server is available without a PocketPal Plus purchase.
+            Other Plus features remain unchanged.
+            Built from commit ${{ github.sha }} with a fixed release signature.
+          files: |
+            ${{ steps.package.outputs.apk_name }}
+            ${{ steps.package.outputs.apk_name }}.sha256
+          generate_release_notes: true

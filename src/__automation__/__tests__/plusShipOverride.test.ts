@@ -44,9 +44,9 @@ describe('plusShipOverride', () => {
     expect(isPlusAvailable()).toBe(true);
   });
 
-  it('accepts several features and clears with none', async () => {
-    await plusShipOverride.set('handsFreeVoice,localApiServer');
-    expect(shipped()).toEqual(['handsFreeVoice', 'localApiServer']);
+  it('accepts a feature and clears with none', async () => {
+    await plusShipOverride.set('handsFreeVoice');
+    expect(shipped()).toEqual(['handsFreeVoice']);
 
     await expect(plusShipOverride.set('none')).resolves.toBe(
       'PLUS_SHIP_OVERRIDE none',
@@ -58,8 +58,8 @@ describe('plusShipOverride', () => {
   it('rejects an unknown feature and keeps the current set', async () => {
     await plusShipOverride.set('handsFreeVoice');
 
-    await expect(plusShipOverride.set('localApiServer,nope')).resolves.toBe(
-      'PLUS_SHIP_OVERRIDE unknown feature: nope',
+    await expect(plusShipOverride.set('localApiServer')).resolves.toBe(
+      'PLUS_SHIP_OVERRIDE unknown feature: localApiServer',
     );
 
     expect(shipped()).toEqual(['handsFreeVoice']);
@@ -71,12 +71,12 @@ describe('plusShipOverride', () => {
   it('restores the stored set on the next launch', async () => {
     await AsyncStorage.setItem(
       PLUS_SHIP_KEY,
-      JSON.stringify(['localApiServer']),
+      JSON.stringify(['handsFreeVoice']),
     );
 
     await plusShipOverride.restore();
 
-    expect(shipped()).toEqual(['localApiServer']);
+    expect(shipped()).toEqual(['handsFreeVoice']);
   });
 
   it.each(['not json', '{"a":1}', '[1,"gone"]'])(
