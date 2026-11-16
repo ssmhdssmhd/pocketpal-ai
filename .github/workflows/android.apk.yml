@@ -114,6 +114,12 @@ jobs:
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > app/pocketpal-release-key.keystore
           chmod 600 app/pocketpal-release-key.keystore
 
+      - name: Test Android download controller
+        working-directory: android
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/.gradle
+        run: ./gradlew testProdDebugUnitTest --tests com.pocketpal.download.DownloadControllerTest
+
       - name: Build Android release APK
         working-directory: android
         env:
@@ -156,19 +162,26 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(tr -d '[:space:]' < .version)
-          APK_NAME="PocketPal.AI.${VERSION}.apk"
+          APK_NAME="MXPocketPal.Al.apk"
+          EXPECTED_CERT_SHA256="de0649f5f4ab91d3f1f72d182f79212e10cbc8f2f76cc876049d2a2c11be5fc5"
           cp android/app/build/outputs/apk/prod/release/app-prod-release.apk "$APK_NAME"
-          "$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --print-certs "$APK_NAME"
+          APKSIGNER_OUTPUT=$("$ANDROID_HOME/build-tools/37.0.0/apksigner" verify --print-certs "$APK_NAME")
+          printf '%s\n' "$APKSIGNER_OUTPUT"
+          CERT_SHA256=$(printf '%s\n' "$APKSIGNER_OUTPUT" | awk -F': ' '/certificate SHA-256 digest:/ {print $2; exit}')
+          if [ "$CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "::error::Release certificate changed; expected $EXPECTED_CERT_SHA256 but got $CERT_SHA256."
+            exit 1
+          fi
           sha256sum "$APK_NAME" > "$APK_NAME.sha256"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=PocketPal.AI.$VERSION" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=MXPocketPal.Al.$VERSION" >> "$GITHUB_OUTPUT"
           echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Upload payload report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: PocketPal.AI.payload
+          name: MXPocketPal.Al.payload
           path: payload-report.txt
           if-no-files-found: ignore
 
@@ -185,11 +198,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.package.outputs.version }}
-          name: PocketPal.AI.${{ steps.package.outputs.version }}
+          name: MXPocketPal.Al.${{ steps.package.outputs.version }}
           body: |
+            Public Hugging Face model files use hf-mirror.com with automatic official-source fallback.
+            HF tokens are never sent to the mirror; custom download URLs are unchanged.
             Local API server is available without a PocketPal Plus purchase.
             Other Plus features remain unchanged.
-            Built from commit ${{ github.sha }} with a fixed release signature.
+            Built from commit ${{ github.sha }} with the same fixed release signature as v1.23.1.
           files: |
             ${{ steps.package.outputs.apk_name }}
             ${{ steps.package.outputs.apk_name }}.sha256

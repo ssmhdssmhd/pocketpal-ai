@@ -212,9 +212,10 @@ class DownloadModule(reactContext: ReactApplicationContext) : NativeDownloadModu
         }
     }
 
-    private fun sendProgressEvent(downloadId: String, bytesWritten: Long, totalBytes: Long) {
+    private fun sendProgressEvent(downloadId: String, url: String, bytesWritten: Long, totalBytes: Long) {
         val params = Arguments.createMap().apply {
             putString("downloadId", downloadId)
+            putString("url", url)
             putDouble("bytesWritten", bytesWritten.toDouble())
             putDouble("totalBytes", totalBytes.toDouble())
             putDouble("progress", percent(bytesWritten, totalBytes))
@@ -222,17 +223,19 @@ class DownloadModule(reactContext: ReactApplicationContext) : NativeDownloadModu
         sendEvent("onDownloadProgress", params)
     }
 
-    private fun sendCompletionEvent(downloadId: String, filePath: String) {
+    private fun sendCompletionEvent(downloadId: String, url: String, filePath: String) {
         val params = Arguments.createMap().apply {
             putString("downloadId", downloadId)
+            putString("url", url)
             putString("filePath", filePath)
         }
         sendEvent("onDownloadComplete", params)
     }
 
-    private fun sendFailureEvent(downloadId: String, error: String, progress: Double) {
+    private fun sendFailureEvent(downloadId: String, url: String, error: String, progress: Double) {
         val params = Arguments.createMap().apply {
             putString("downloadId", downloadId)
+            putString("url", url)
             putString("error", error)
             putDouble("progress", progress)
         }
@@ -327,11 +330,11 @@ class DownloadModule(reactContext: ReactApplicationContext) : NativeDownloadModu
 
     private suspend fun emitRow(row: DownloadEntity): Boolean {
         when (val event = row.event()) {
-            is RowEvent.Progress -> sendProgressEvent(row.id, event.bytesWritten, event.totalBytes)
-            is RowEvent.Completed -> sendCompletionEvent(row.id, event.filePath)
+            is RowEvent.Progress -> sendProgressEvent(row.id, row.url, event.bytesWritten, event.totalBytes)
+            is RowEvent.Completed -> sendCompletionEvent(row.id, row.url, event.filePath)
             is RowEvent.Failed -> {
                 Log.e(TAG, "Download failed for ID: ${row.id}: ${event.error}")
-                sendFailureEvent(row.id, event.error, event.progress)
+                sendFailureEvent(row.id, row.url, event.error, event.progress)
                 controller.onFailedEmitted(row.id)
             }
             null -> {}

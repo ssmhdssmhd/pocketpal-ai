@@ -31,11 +31,15 @@ Chat with language models, give them a voice, and let them use tools — all on-
 
 ## 当前维护版本
 
-### PocketPal.AI.1.23.1 202611170120
+### MXPocketPal.Al.1.23.3 202611170449
 
+- 国内网络下载公开 Hugging Face 模型文件时优先使用 `hf-mirror.com`，失败后自动回退官方源，提升模型下载速度和可用性。
+- 带访问令牌的 Hugging Face 下载始终使用官方源，令牌不会发送给镜像；非 Hugging Face 自定义 URL 保持不变，切换下载源时不会混用临时文件。
+- 修复镜像回退期间的取消与重复事件竞态、iOS 进度响应式更新，以及 Android 复用下载 ID 时的迟到事件隔离；云端构建同时运行原生下载测试。
 - **Settings → Local API server → Serve the loaded model** 已取消 PocketPal Plus 付费要求，可直接启动；其他 Plus 功能保持不变。
 - 在 GitHub 仓库选择 **Actions → Android APK → Run workflow**，即可从 `main` 分支云端构建签名 APK。
-- 构建产物名为 `PocketPal.AI.1.23.1.apk`，同时发布到 Actions Artifacts 和 GitHub Releases，并附 SHA-256 校验文件。
+- APK 构建产物统一命名为 `MXPocketPal.Al.apk`，同时发布到 Actions Artifacts 和 GitHub Releases，并附 SHA-256 校验文件。
+- 云端构建复用既有固定签名，并强制比对证书 SHA-256 指纹，确保与上一版签名一致，避免覆盖安装冲突。
 - 固定签名文件及密码只保存在 GitHub Secrets：`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_PASSWORD`，不提交到仓库。
 - 完整更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -103,7 +107,7 @@ PocketPal is a four-layer stack, from the silicon up to the chat UI. Each layer 
 | --- | --- |
 | **UI & Tool Use** | The React Native app (UI via React Native Paper, state via MobX, chat history in WatermelonDB). The **`AgentRunner`** drives each chat turn — streaming tokens, dispatching **Talents** (tools) when the model calls them, and feeding results back for follow-up reasoning. **Pals** are configurable personas; **PalsHub** is the in-app marketplace for sharing and buying them. In **voice mode**, your speech is transcribed, answered as a normal chat turn, and the reply is spoken back. |
 | **Bridging** | Native modules that connect JavaScript to the engines. [`llama.rn`](https://github.com/mybigday/llama.rn) bridges LLM inference over JSI; [`whisper.rn`](https://github.com/mybigday/whisper.rn) bridges speech recognition; [`@pocketpalai/react-native-speech`](https://github.com/a-ghorbani/react-native-speech) and `onnxruntime-react-native` bridge text-to-speech, with the `@pocketpalai/react-native-speech-phonon` add-on for Phonon. |
-| **Engine** | The inference engines. **llama.cpp** runs language models in the quantized **GGUF** format. **whisper.cpp** runs Whisper speech recognition models in the **GGML** format. **ONNX Runtime** runs the Kokoro, Kitten and Supertonic voice models in the **ONNX** format. **Phonon** runs natively in its own Rust runtime: a GGUF model on the CPU on Android, a Core ML model on iOS. |
+| **Engine** | The inference engines. **llama.cpp** runs language models in the quantized **GGUF** format. **whisper.cpp** runs Whisper speech recognition models in the **GGML** format. **ONNX Runtime** runs the Kokoro, Kitten and Supertonic voice models in the **ONNX** format. **Phonon** runs natively in its own Rust runtime: a GGUF model on the CPU for Android, a Core ML model on iOS. |
 | **Hardware** | Where the math actually happens. PocketPal targets **CPU** (universal fallback), **GPU** (Metal on iOS, OpenCL on Qualcomm Adreno for Android), and **NPU** (Qualcomm Hexagon, and the Apple Neural Engine for Phonon on iOS) — falling back gracefully and offloading partial layers when a full backend isn't available. |
 
 ## Using the app
@@ -287,7 +291,7 @@ Versions are pinned in [`package.json`](package.json); the highlights:
 
 <br/>
 
-A **Talent** is a tool the model can call mid-conversation. Engines are registered in a `TalentRegistry`, exposed to the model as tool schemas; the `AgentRunner` detects a call, runs the engine, and returns the result for the next turn.
+A **Talent** is a tool the model can call mid-conversation. Engines are registered in a `TalentRegistry`, exposed as tool schemas; the `AgentRunner` detects a call, runs the engine, and returns the result for the next turn.
 
 | Talent | Engine | Does |
 | --- | --- | --- |
@@ -327,7 +331,7 @@ Have an idea or found a bug? [Open an issue](https://github.com/a-ghorbani/pocke
 - 💬 **Questions & ideas** — [GitHub Discussions](https://github.com/a-ghorbani/pocketpal-ai/discussions)
 - 🐛 **Bugs & requests** — [GitHub Issues](https://github.com/a-ghorbani/pocketpal-ai/issues/new/choose)
 - 🌐 **Website** — [pocketpal.dev](https://pocketpal.dev/)
-- ❤️ **Support development** — PocketPal is free and ad-free; [sponsoring](https://github.com/sponsors/a-ghorbani) helps keep it that way.
+- ❤️ **Support development** — [Sponsoring](https://github.com/sponsors/a-ghorbani) helps keep it that way.
 
 ## License
 
@@ -339,11 +343,9 @@ PocketPal AI stands on the shoulders of the open-source community, including:
 
 - **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — efficient on-device LLM inference.
 - **[llama.rn](https://github.com/mybigday/llama.rn)** — llama.cpp bindings for React Native.
-- **[whisper.cpp](https://github.com/ggml-org/whisper.cpp)** — on-device speech recognition.
-- **[whisper.rn](https://github.com/mybigday/whisper.rn)** — whisper.cpp bindings for React Native.
+- **[whisper.cpp](https://github.com/mybigday/whisper.cpp)** — whisper.cpp bindings for React Native.
 - **[@pocketpalai/react-native-speech](https://github.com/a-ghorbani/react-native-speech)** — React Native TTS bridge powering on-device voices.
 - **[Phonon](https://github.com/gradium-ai/xn-ptts)** by Gradium — on-device TTS model, built on Kyutai's Pocket TTS and Mimi.
-- **[ONNX Runtime](https://onnxruntime.ai/)** — cross-platform inference engine powering on-device TTS.
 - **[React Native](https://reactnative.dev/)**, **[MobX](https://mobx.js.org/)**, **[React Native Paper](https://callstack.github.io/react-native-paper/)**, **[React Navigation](https://reactnavigation.org/)**, **[WatermelonDB](https://github.com/Nozbe/WatermelonDB)**, and many other open-source libraries that make this project possible.
 
 <div align="center">
