@@ -26,6 +26,10 @@ export interface DownloadJob {
     error: Error | null;
   };
   destination: string;
+  /** Actual source of the current native attempt; IDs may be reused. */
+  activeDownloadUrl?: string;
+  /** Official HF URL to try once if the public mirror fails. */
+  officialFallbackUrl?: string;
   lastBytesWritten: number;
   lastUpdateTime: number;
 }

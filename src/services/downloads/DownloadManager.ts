@@ -47,6 +47,21 @@ const isHuggingFaceUrl = (url: string | undefined): boolean => {
   }
 };
 
+// Mirror only public model files. API calls, web pages, custom URLs, and
+// authenticated downloads stay on their original hosts.
+const getPublicHuggingFaceMirrorUrl = (
+  url: string | undefined,
+): string | null => {
+  if (!isHuggingFaceUrl(url)) {
+    return null;
+  }
+  const parsed = new URL(url!);
+  if (!parsed.pathname.includes('/resolve/')) {
+    return null;
+  }
+  return `https://hf-mirror.com${parsed.pathname}${parsed.search}${parsed.hash}`;
+};
+
 export class DownloadManager {
   private downloadJobs: DownloadMap;
   private callbacks: DownloadEventCallbacks = {};
@@ -54,15 +69,19 @@ export class DownloadManager {
     onDownloadProgress: [
       {
         downloadId: string;
+        url?: string;
         bytesWritten: number;
         totalBytes: number;
         progress: number;
       },
     ];
-    onDownloadComplete: [{downloadId: string; filePath: string}];
-    onDownloadFailed: [{downloadId: string; error: string; progress?: number}];
+    onDownloadComplete: [{downloadId: string; url?: string; filePath: string}];
+    onDownloadFailed: [
+      {downloadId: string; url?: string; error: string; progress?: number},
+    ];
   }> | null = null;
   private cancelledModelIds = new Set<string>();
+  private androidFallbackJobs = new Set<DownloadJob>();
 
   constructor() {
     console.log(`${TAG}: Initializing DownloadManager`);
@@ -98,6 +117,9 @@ export class DownloadManager {
           console.warn(
             `${TAG}: No job found for download ID: ${event.downloadId}. This may indicate the job was completed or cancelled.`,
           );
+          return;
+        }
+        if (event.url && event.url !== job.activeDownloadUrl) {
           return;
         }
 
@@ -151,6 +173,9 @@ export class DownloadManager {
         );
 
         if (job) {
+          if (event.url && event.url !== job.activeDownloadUrl) {
+            return;
+          }
           // Set final state before removing
           runInAction(() => {
             job.state.isDownloading = false;
@@ -177,40 +202,142 @@ export class DownloadManager {
         }
       });
 
-      this.eventEmitter.addListener('onDownloadFailed', event => {
-        console.error(
-          `${TAG}: (js) Download failed for ID: ${event.downloadId}`,
-          event.error,
-        );
-        // Find the job by download ID
-        const job = Array.from(this.downloadJobs.values()).find(
-          _job => _job.downloadId === event.downloadId,
-        );
-
-        if (job) {
-          runInAction(() => {
-            job.state.error = new Error(event.error);
-            job.state.isDownloading = false;
-          });
-          // Ensure callback is called before removing the job
-          this.callbacks.onError?.(
-            job.model.id,
-            new Error(event.error),
-            event.progress ?? 0,
-          );
-          runInAction(() => {
-            this.downloadJobs.delete(job.model.id);
-          });
-          console.log(`${TAG}: Removed failed job: ${job.model.id}`);
-        } else {
-          console.warn(
-            `${TAG}: Failure event received for non-existent job: ${event.downloadId}`,
-          );
-        }
+      this.eventEmitter.addListener('onDownloadFailed', async event => {
+        await this.handleAndroidDownloadFailed(event);
       });
     } else {
       console.error(`${TAG}: DownloadModule is not available`);
     }
+  }
+
+  private async handleAndroidDownloadFailed(event: {
+    downloadId: string;
+    url?: string;
+    error: string;
+    progress?: number;
+  }): Promise<void> {
+    console.error(
+      `${TAG}: (js) Download failed for ID: ${event.downloadId}`,
+      event.error,
+    );
+    const job = Array.from(this.downloadJobs.values()).find(
+      candidate => candidate.downloadId === event.downloadId,
+    );
+    if (!job) {
+      console.warn(
+        `${TAG}: Failure event received for non-existent job: ${event.downloadId}`,
+      );
+      return;
+    }
+    if (this.cancelledModelIds.has(job.model.id) || !job.state.isDownloading) {
+      return;
+    }
+    if (event.url && event.url !== job.activeDownloadUrl) {
+      return;
+    }
+    if (this.androidFallbackJobs.has(job)) {
+      // A native row can reuse its ID for the official retry. A matching URL
+      // identifies a real official failure; older mirror events were filtered
+      // above, and legacy events without a URL are safest to ignore here.
+      if (event.url) {
+        this.reportAndroidDownloadFailure(
+          job,
+          new Error(event.error),
+          event.progress ?? 0,
+        );
+      }
+      return;
+    }
+
+    const officialFallbackUrl = job.officialFallbackUrl;
+    if (officialFallbackUrl) {
+      this.androidFallbackJobs.add(job);
+      runInAction(() => {
+        // Consume the fallback before starting it so duplicate native events
+        // cannot launch more than one official-source retry.
+        job.officialFallbackUrl = undefined;
+        job.activeDownloadUrl = officialFallbackUrl;
+      });
+      try {
+        const config: DownloadConfig = {
+          destination: job.destination,
+          networkType: 'ANY',
+          priority: 1,
+          progressInterval: 1000,
+        };
+        // DownloadController resets validators and deletes the .part file when
+        // the URL changes, so mirror and official bytes are never mixed.
+        const response = await NativeDownloadModule.startDownload(
+          officialFallbackUrl,
+          config,
+        );
+        if (
+          this.downloadJobs.get(job.model.id) !== job ||
+          this.cancelledModelIds.has(job.model.id) ||
+          !job.state.isDownloading
+        ) {
+          // The user cancelled while the native fallback was starting.
+          try {
+            await NativeDownloadModule.cancelDownload(response.downloadId);
+          } catch (cancelError) {
+            console.warn(
+              `${TAG}: Could not cancel the late fallback download`,
+              cancelError,
+            );
+          }
+          return;
+        }
+        runInAction(() => {
+          job.downloadId = response.downloadId;
+          job.state.error = null;
+          job.state.progress = null;
+          job.lastBytesWritten = 0;
+          job.lastUpdateTime = Date.now();
+        });
+        console.log(
+          `${TAG}: Retrying ${job.model.id} from Hugging Face with ID: ${response.downloadId}`,
+        );
+        return;
+      } catch (error) {
+        if (
+          this.downloadJobs.get(job.model.id) !== job ||
+          this.cancelledModelIds.has(job.model.id) ||
+          !job.state.isDownloading
+        ) {
+          return;
+        }
+        this.reportAndroidDownloadFailure(
+          job,
+          error instanceof Error ? error : new Error(String(error)),
+          event.progress ?? 0,
+        );
+        return;
+      } finally {
+        this.androidFallbackJobs.delete(job);
+      }
+    }
+
+    this.reportAndroidDownloadFailure(
+      job,
+      new Error(event.error),
+      event.progress ?? 0,
+    );
+  }
+
+  private reportAndroidDownloadFailure(
+    job: DownloadJob,
+    error: Error,
+    keptProgress: number,
+  ): void {
+    runInAction(() => {
+      job.state.error = error;
+      job.state.isDownloading = false;
+    });
+    this.callbacks.onError?.(job.model.id, error, keptProgress);
+    runInAction(() => {
+      this.downloadJobs.delete(job.model.id);
+    });
+    console.log(`${TAG}: Removed failed job: ${job.model.id}`);
   }
 
   private calculateEta(
@@ -279,15 +406,24 @@ export class DownloadManager {
       return;
     }
 
-    // Only send the HF auth token to huggingface.co.
-    const effectiveAuthToken = isHuggingFaceUrl(model.downloadUrl)
-      ? authToken
-      : null;
-
     if (!model.downloadUrl) {
       console.error(`${TAG}: Model has no download URL`);
       throw new Error('Model has no download URL');
     }
+
+    const officialDownloadUrl = model.downloadUrl;
+    // Only send the HF auth token to huggingface.co. Authenticated downloads
+    // also stay on the official host so private model URLs never hit a mirror.
+    const effectiveAuthToken = isHuggingFaceUrl(officialDownloadUrl)
+      ? authToken
+      : null;
+    const mirrorDownloadUrl = effectiveAuthToken
+      ? null
+      : getPublicHuggingFaceMirrorUrl(officialDownloadUrl);
+    const initialDownloadUrl = mirrorDownloadUrl ?? officialDownloadUrl;
+    const officialFallbackUrl = mirrorDownloadUrl
+      ? officialDownloadUrl
+      : undefined;
 
     const isEnoughSpace = await hasEnoughSpace(model);
     if (!isEnoughSpace) {
@@ -311,12 +447,20 @@ export class DownloadManager {
     }
 
     if (Platform.OS === 'ios') {
-      await this.startIOSDownload(model, destinationPath, effectiveAuthToken);
+      await this.startIOSDownload(
+        model,
+        destinationPath,
+        effectiveAuthToken,
+        initialDownloadUrl,
+        officialFallbackUrl,
+      );
     } else {
       await this.startAndroidDownload(
         model,
         destinationPath,
         effectiveAuthToken,
+        initialDownloadUrl,
+        officialFallbackUrl,
       );
     }
   }
@@ -324,117 +468,162 @@ export class DownloadManager {
   private async startIOSDownload(
     model: Model,
     destinationPath: string,
-    authToken?: string | null,
+    authToken: string | null | undefined,
+    initialDownloadUrl: string,
+    officialFallbackUrl?: string,
   ): Promise<void> {
     try {
-      const downloadJob: DownloadJob = {
-        model,
-        state: {
-          isDownloading: true,
-          progress: null,
-          error: null,
-        },
-        destination: destinationPath,
-        lastBytesWritten: 0,
-        lastUpdateTime: Date.now(),
-      };
-
       runInAction(() => {
-        this.downloadJobs.set(model.id, downloadJob);
+        this.downloadJobs.set(model.id, {
+          model,
+          state: {
+            isDownloading: true,
+            progress: null,
+            error: null,
+          },
+          destination: destinationPath,
+          lastBytesWritten: 0,
+          lastUpdateTime: Date.now(),
+        });
       });
+      // observable.map wraps stored objects. Keep the wrapped job so progress
+      // and attempt IDs update the same object observed by the UI.
+      const downloadJob = this.downloadJobs.get(model.id)!;
       this.callbacks.onStart?.(model.id);
 
-      // Create the download task
-      const downloadResult = RNFS.downloadFile({
-        fromUrl: model.downloadUrl!,
-        toFile: destinationPath,
-        background: uiStore.iOSBackgroundDownloading,
-        discretionary: false,
-        progressInterval: 800,
-        headers: {
-          'User-Agent': hfUserAgent(),
-          ...(authToken ? {Authorization: `Bearer ${authToken}`} : {}),
-        },
-        begin: res => {
-          console.log(`${TAG}: Download started for ID: ${model.id}`, {
-            statusCode: res.statusCode,
-            contentLength: res.contentLength,
-            headers: res.headers,
-            jobId: downloadResult.jobId,
+      const runAttempt = async (downloadUrl: string): Promise<Error | null> => {
+        try {
+          const downloadResult = RNFS.downloadFile({
+            fromUrl: downloadUrl,
+            toFile: destinationPath,
+            background: uiStore.iOSBackgroundDownloading,
+            discretionary: false,
+            progressInterval: 800,
+            headers: {
+              'User-Agent': hfUserAgent(),
+              ...(authToken && isHuggingFaceUrl(downloadUrl)
+                ? {Authorization: `Bearer ${authToken}`}
+                : {}),
+            },
+            begin: res => {
+              const job = this.downloadJobs.get(model.id);
+              if (job?.jobId !== downloadResult.jobId) {
+                return;
+              }
+              console.log(`${TAG}: Download started for ID: ${model.id}`, {
+                statusCode: res.statusCode,
+                contentLength: res.contentLength,
+                headers: res.headers,
+                jobId: downloadResult.jobId,
+              });
+
+              const progress: DownloadProgress = {
+                bytesDownloaded: 0,
+                bytesTotal: res.contentLength,
+                progress: 0,
+                speed: '0 B/s',
+                eta: uiStore.l10n.common.calculating,
+                rawSpeed: 0,
+                rawEta: 0,
+              };
+
+              runInAction(() => {
+                job.state.progress = progress;
+              });
+              this.callbacks.onProgress?.(model.id, progress);
+            },
+            progress: res => {
+              const job = this.downloadJobs.get(model.id);
+              if (job?.jobId !== downloadResult.jobId) {
+                return;
+              }
+
+              const currentTime = Date.now();
+              const timeDiff = (currentTime - job.lastUpdateTime) / 1000 || 1;
+              const bytesDiff = res.bytesWritten - job.lastBytesWritten;
+              const speedBps = bytesDiff / timeDiff;
+              const speedMBps = (speedBps / (1024 * 1024)).toFixed(2);
+
+              const remainingBytes = res.contentLength - res.bytesWritten;
+              const etaSeconds = speedBps > 0 ? remainingBytes / speedBps : 0;
+              const etaMinutes = Math.ceil(etaSeconds / 60);
+              const l10nData = uiStore.l10n;
+              const etaText =
+                etaSeconds >= 60
+                  ? `${etaMinutes} ${l10nData.common.minutes}`
+                  : `${Math.ceil(etaSeconds)} ${l10nData.common.seconds}`;
+
+              const progress: DownloadProgress = {
+                bytesDownloaded: res.bytesWritten,
+                bytesTotal: res.contentLength,
+                progress: (res.bytesWritten / res.contentLength) * 100,
+                speed: `${formatBytes(res.bytesWritten)} (${speedMBps} MB/s)`,
+                eta: etaText,
+                rawSpeed: speedBps,
+                rawEta: etaSeconds,
+              };
+
+              runInAction(() => {
+                job.state.progress = progress;
+                job.lastBytesWritten = res.bytesWritten;
+                job.lastUpdateTime = currentTime;
+              });
+
+              this.callbacks.onProgress?.(model.id, progress);
+            },
           });
 
-          // Initialize progress
-          const progress: DownloadProgress = {
-            bytesDownloaded: 0,
-            bytesTotal: res.contentLength,
-            progress: 0,
-            speed: '0 B/s',
-            eta: uiStore.l10n.common.calculating,
-            rawSpeed: 0,
-            rawEta: 0,
-          };
-
+          console.log(
+            `${TAG}: Created download with jobId: ${downloadResult.jobId}`,
+          );
           runInAction(() => {
-            downloadJob.state.progress = progress;
+            if (this.downloadJobs.get(model.id) === downloadJob) {
+              downloadJob.jobId = downloadResult.jobId;
+            }
           });
-          this.callbacks.onProgress?.(model.id, progress);
-        },
-        progress: res => {
-          if (!this.downloadJobs.has(model.id)) {
-            return;
+
+          const result = await downloadResult.promise;
+          return result.statusCode === 200
+            ? null
+            : new Error(`Download failed with status: ${result.statusCode}`);
+        } catch (error) {
+          return error instanceof Error ? error : new Error(String(error));
+        }
+      };
+
+      let downloadError = await runAttempt(initialDownloadUrl);
+      if (
+        downloadError &&
+        officialFallbackUrl &&
+        !this.cancelledModelIds.has(model.id) &&
+        this.downloadJobs.get(model.id) === downloadJob
+      ) {
+        console.warn(
+          `${TAG}: Mirror download failed for ${model.id}; retrying from Hugging Face`,
+        );
+        runInAction(() => {
+          downloadJob.state.progress = null;
+          downloadJob.lastBytesWritten = 0;
+          downloadJob.lastUpdateTime = Date.now();
+        });
+        try {
+          // RNFS writes directly to the destination; do not mix mirror bytes
+          // with the official response when retrying.
+          await RNFS.unlink(destinationPath);
+        } catch (error) {
+          if ((error as {code?: string})?.code !== 'ENOENT') {
+            throw error;
           }
+        }
+        if (
+          !this.cancelledModelIds.has(model.id) &&
+          this.downloadJobs.get(model.id) === downloadJob
+        ) {
+          downloadError = await runAttempt(officialFallbackUrl);
+        }
+      }
 
-          const job = this.downloadJobs.get(model.id)!;
-          const currentTime = Date.now();
-          const timeDiff = (currentTime - job.lastUpdateTime) / 1000 || 1;
-          const bytesDiff = res.bytesWritten - job.lastBytesWritten;
-          const speedBps = bytesDiff / timeDiff;
-          const speedMBps = (speedBps / (1024 * 1024)).toFixed(2);
-
-          const remainingBytes = res.contentLength - res.bytesWritten;
-          const etaSeconds = speedBps > 0 ? remainingBytes / speedBps : 0;
-          const etaMinutes = Math.ceil(etaSeconds / 60);
-          const l10nData = uiStore.l10n;
-          const etaText =
-            etaSeconds >= 60
-              ? `${etaMinutes} ${l10nData.common.minutes}`
-              : `${Math.ceil(etaSeconds)} ${l10nData.common.seconds}`;
-
-          const progress: DownloadProgress = {
-            bytesDownloaded: res.bytesWritten,
-            bytesTotal: res.contentLength,
-            progress: (res.bytesWritten / res.contentLength) * 100,
-            speed: `${formatBytes(res.bytesWritten)} (${speedMBps} MB/s)`,
-            eta: etaText,
-            rawSpeed: speedBps,
-            rawEta: etaSeconds,
-          };
-
-          runInAction(() => {
-            job.state.progress = progress;
-            job.lastBytesWritten = res.bytesWritten;
-            job.lastUpdateTime = currentTime;
-          });
-
-          this.callbacks.onProgress?.(model.id, progress);
-        },
-      });
-
-      // Store the jobId immediately for cancellation
-      downloadJob.jobId = downloadResult.jobId;
-      console.log(
-        `${TAG}: Created download with jobId: ${downloadResult.jobId}`,
-      );
-
-      // Add job to map after setting jobId
-      runInAction(() => {
-        this.downloadJobs.set(model.id, downloadJob);
-      });
-
-      // Wait for the download to complete
-      const result = await downloadResult.promise;
-
-      if (result.statusCode === 200) {
+      if (!downloadError) {
         console.log(
           `${TAG}: Download completed successfully for ID: ${model.id}`,
         );
@@ -447,9 +636,10 @@ export class DownloadManager {
         this.cancelledModelIds.delete(model.id);
       } else {
         console.error(
-          `${TAG}: Download failed with status: ${result.statusCode} for ID: ${model.id}`,
+          `${TAG}: Download failed for ID: ${model.id}:`,
+          downloadError,
         );
-        throw new Error(`Download failed with status: ${result.statusCode}`);
+        throw downloadError;
       }
     } catch (error) {
       // RNFS.stopDownload aborts the task, rejecting this promise. A user
@@ -483,7 +673,9 @@ export class DownloadManager {
   private async startAndroidDownload(
     model: Model,
     destinationPath: string,
-    authToken?: string | null,
+    authToken: string | null | undefined,
+    initialDownloadUrl: string,
+    officialFallbackUrl?: string,
   ): Promise<void> {
     try {
       console.log(`${TAG}: Starting Android download for model:`, {
@@ -499,6 +691,8 @@ export class DownloadManager {
           error: null,
         },
         destination: destinationPath,
+        activeDownloadUrl: initialDownloadUrl,
+        officialFallbackUrl,
         lastBytesWritten: 0,
         lastUpdateTime: Date.now(),
       };
@@ -509,11 +703,31 @@ export class DownloadManager {
         networkType: 'ANY',
         priority: 1,
         progressInterval: 1000,
-        ...(authToken ? {authToken} : {}),
+        ...(authToken && isHuggingFaceUrl(initialDownloadUrl)
+          ? {authToken}
+          : {}),
       };
       await ensureNotificationPermission();
-      const response: DownloadResponse =
-        await NativeDownloadModule.startDownload(model.downloadUrl!, config);
+      let response: DownloadResponse;
+      try {
+        response = await NativeDownloadModule.startDownload(
+          initialDownloadUrl,
+          config,
+        );
+      } catch (error) {
+        if (!officialFallbackUrl) {
+          throw error;
+        }
+        console.warn(
+          `${TAG}: Could not start mirror download for ${model.id}; trying Hugging Face`,
+        );
+        response = await NativeDownloadModule.startDownload(
+          officialFallbackUrl,
+          config,
+        );
+        downloadJob.officialFallbackUrl = undefined;
+        downloadJob.activeDownloadUrl = officialFallbackUrl;
+      }
 
       // Store the download ID
       downloadJob.downloadId = response.downloadId;
@@ -554,6 +768,12 @@ export class DownloadManager {
       // Mark as user-cancelled so the iOS download promise rejection is
       // recognised as a cancel, not surfaced as a "Download Failed" error.
       this.cancelledModelIds.add(modelId);
+      runInAction(() => {
+        // Invalidate the job before the first await so a late native failure
+        // cannot start the official-source fallback while cancellation runs.
+        job.state.isDownloading = false;
+        job.officialFallbackUrl = undefined;
+      });
       try {
         if (Platform.OS === 'ios') {
           console.log(
@@ -631,6 +851,7 @@ export class DownloadManager {
     }
     this.downloadJobs.clear();
     this.cancelledModelIds.clear();
+    this.androidFallbackJobs.clear();
     console.log(`${TAG}: Download jobs cleared`);
   }
 
@@ -659,7 +880,11 @@ export class DownloadManager {
       // For each active download, find the corresponding model and create a download job
       for (const download of activeDownloads) {
         const model = models.find(m => {
-          return m.downloadUrl && download.url === m.downloadUrl;
+          return (
+            m.downloadUrl &&
+            (download.url === m.downloadUrl ||
+              download.url === getPublicHuggingFaceMirrorUrl(m.downloadUrl))
+          );
         });
 
         if (!model) {
@@ -697,6 +922,12 @@ export class DownloadManager {
             error: null,
           },
           destination: download.destination,
+          activeDownloadUrl: download.url,
+          officialFallbackUrl:
+            model.downloadUrl &&
+            download.url === getPublicHuggingFaceMirrorUrl(model.downloadUrl)
+              ? model.downloadUrl
+              : undefined,
           lastBytesWritten: bytesWritten,
           lastUpdateTime: Date.now(),
         };
