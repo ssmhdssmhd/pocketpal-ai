@@ -7,6 +7,14 @@ import {basicModel} from '../../../../jest/fixtures/models';
 import {DownloadManager, DownloadCancelledError} from '../DownloadManager';
 import {ensureNotificationPermission} from '../../../utils/androidPermission';
 
+const hfFileModel = {
+  ...basicModel,
+  downloadUrl:
+    'https://huggingface.co/test/test-model-1/resolve/main/test-model-1.gguf',
+};
+const hfMirrorUrl =
+  'https://hf-mirror.com/test/test-model-1/resolve/main/test-model-1.gguf';
+
 jest.mock('../../../utils/androidPermission', () => ({
   ensureNotificationPermission: jest.fn().mockResolvedValue(undefined),
 }));
@@ -112,6 +120,311 @@ describe('DownloadManager', () => {
     expect(downloadManager.isDownloading('model-1')).toBe(true);
   });
 
+  it('uses the public mirror for an unauthenticated HF file on Android', async () => {
+    NativeModules.DownloadModule.startDownload.mockResolvedValue({
+      downloadId: 'mirror-download',
+    });
+
+    await downloadManager.startDownload(hfFileModel, '/path/to/model.bin');
+
+    expect(NativeModules.DownloadModule.startDownload).toHaveBeenCalledWith(
+      hfMirrorUrl,
+      expect.objectContaining({
+        destination: '/path/to/model.bin',
+      }),
+    );
+    const config = NativeModules.DownloadModule.startDownload.mock.calls[0][1];
+    expect(config.authToken).toBeUndefined();
+  });
+
+  it('keeps authenticated HF downloads on the official host on Android', async () => {
+    NativeModules.DownloadModule.startDownload.mockResolvedValue({
+      downloadId: 'official-download',
+    });
+
+    await downloadManager.startDownload(
+      hfFileModel,
+      '/path/to/model.bin',
+      'secret-token',
+    );
+
+    expect(NativeModules.DownloadModule.startDownload).toHaveBeenCalledTimes(1);
+    expect(NativeModules.DownloadModule.startDownload).toHaveBeenCalledWith(
+      hfFileModel.downloadUrl,
+      expect.objectContaining({authToken: 'secret-token'}),
+    );
+  });
+
+  it('falls back to HF and tracks the new Android download ID', async () => {
+    NativeModules.DownloadModule.startDownload
+      .mockResolvedValueOnce({downloadId: 'mirror-download'})
+      .mockResolvedValueOnce({downloadId: 'official-download'});
+    const callbacks = {onError: jest.fn(), onComplete: jest.fn()};
+    downloadManager.setCallbacks(callbacks);
+    await downloadManager.startDownload(hfFileModel, '/path/to/model.bin');
+    const [, emitFailure] = mockEventEmitter.addListener.mock.calls.find(
+      ([name]: [string]) => name === 'onDownloadFailed',
+    );
+    const [, emitComplete] = mockEventEmitter.addListener.mock.calls.find(
+      ([name]: [string]) => name === 'onDownloadComplete',
+    );
+
+    await emitFailure({downloadId: 'mirror-download', error: 'stalled'});
+
+    expect(NativeModules.DownloadModule.startDownload).toHaveBeenNthCalledWith(
+      2,
+      hfFileModel.downloadUrl,
+      expect.objectContaining({destination: '/path/to/model.bin'}),
+    );
+    expect(callbacks.onError).not.toHaveBeenCalled();
+    expect(downloadManager.isDownloading('model-1')).toBe(true);
+
+    emitComplete({
+      downloadId: 'official-download',
+      filePath: '/path/to/model.bin',
+    });
+    expect(callbacks.onComplete).toHaveBeenCalledWith('model-1');
+    expect(downloadManager.isDownloading('model-1')).toBe(false);
+  });
+
+  it('reports an Android error only after the official fallback also fails', async () => {
+    NativeModules.DownloadModule.startDownload
+      .mockResolvedValueOnce({downloadId: 'mirror-download'})
+      .mockResolvedValueOnce({downloadId: 'official-download'});
+    const onError = jest.fn();
+    downloadManager.setCallbacks({onError});
+    await downloadManager.startDownload(hfFileModel, '/path/to/model.bin');
+    const [, emitFailure] = mockEventEmitter.addListener.mock.calls.find(
+      ([name]: [string]) => name === 'onDownloadFailed',
+    );
+
+    await emitFailure({downloadId: 'mirror-download', error: 'mirror failed'});
+    expect(onError).not.toHaveBeenCalled();
+    await emitFailure({
+      downloadId: 'official-download',
+      error: 'official failed',
+      progress: 25,
+    });
+
+    expect(onError).toHaveBeenCalledWith(
+      'model-1',
+      expect.objectContaining({message: 'official failed'}),
+      25,
+    );
+    expect(downloadManager.isDownloading('model-1')).toBe(false);
+  });
+
+  it('does not start an Android fallback after user cancellation', async () => {
+    NativeModules.DownloadModule.startDownload.mockResolvedValue({
+      downloadId: 'mirror-download',
+    });
+    const onError = jest.fn();
+    downloadManager.setCallbacks({onError});
+    await downloadManager.startDownload(hfFileModel, '/path/to/model.bin');
+    const [, emitFailure] = mockEventEmitter.addListener.mock.calls.find(
+      ([name]: [string]) => name === 'onDownloadFailed',
+    );
+
+    await downloadManager.cancelDownload('model-1');
+    await emitFailure({downloadId: 'mirror-download', error: 'cancelled'});
+
+    expect(NativeModules.DownloadModule.startDownload).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('does not fall back while Android cancellation is still pending', async () => {
+    NativeModules.DownloadModule.startDownload.mockResolvedValue({
+      downloadId: 'mirror-download',
+    });
+    let finishNativeCancel: () => void = () => {};
+    const nativeCancel = new Promise<void>(resolve => {
+      finishNativeCancel = resolve;
+    });
+    NativeModules.DownloadModule.cancelDownload.mockReturnValue(nativeCancel);
+    const onError = jest.fn();
+    downloadManager.setCallbacks({onError});
+    await downloadManager.startDownload(hfFileModel, '/path/to/model.bin');
+    const [, emitFailure] = mockEventEmitter.addListener.mock.calls.find(
+      ([name]: [string]) => name === 'onDownloadFailed',
+    );
+
+    const cancellation = downloadManager.cancelDownload('model-1');
+    await emitFailure({downloadId: 'mirror-download', error: 'stalled'});
+
+    expect(NativeModules.DownloadModule.startDownload).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+
+    finishNativeCancel();
+    await cancellation;
+    expect(downloadManager.isDownloading('model-1')).toBe(false);
+  });
+
+  it('ignores duplicate mirror failures while the Android fallback starts', async () => {
+    let resolveFallback: (response: {downloadId: string}) => void = () => {};
+    const fallbackResponse = new Promise<{downloadId: string}>(resolve => {
+      resolveFallback = resolve;
+    });
+    NativeModules.DownloadModule.startDownload
+      .mockResolvedValueOnce({downloadId: 'mirror-download'})
+      .mockReturnValueOnce(fallbackResponse);
+    const onError = jest.fn();
+    downloadManager.setCallbacks({onError});
+    await downloadManager.startDownload(hfFileModel, '/path/to/model.bin');
+    const [, emitFailure] = mockEventEmitter.addListener.mock.calls.find(
+      ([name]: [string]) => name === 'onDownloadFailed',
+    );
+
+    const firstFailure = emitFailure({
+      downloadId: 'mirror-download',
+      error: 'mirror failed',
+    });
+    await emitFailure({
+      downloadId: 'mirror-download',
+      error: 'duplicate mirror failure',
+    });
+
+    expect(NativeModules.DownloadModule.startDownload).toHaveBeenCalledTimes(2);
+    expect(onError).not.toHaveBeenCalled();
+    expect(downloadManager.isDownloading('model-1')).toBe(true);
+
+    resolveFallback({downloadId: 'official-download'});
+    await firstFailure;
+    expect(onError).not.toHaveBeenCalled();
+    expect(downloadManager.isDownloading('model-1')).toBe(true);
+  });
+
+  it('cancels a late Android fallback response after user cancellation', async () => {
+    let resolveFallback: (response: {downloadId: string}) => void = () => {};
+    const fallbackResponse = new Promise<{downloadId: string}>(resolve => {
+      resolveFallback = resolve;
+    });
+    NativeModules.DownloadModule.startDownload
+      .mockResolvedValueOnce({downloadId: 'mirror-download'})
+      .mockReturnValueOnce(fallbackResponse);
+    NativeModules.DownloadModule.cancelDownload.mockResolvedValue(undefined);
+    const onError = jest.fn();
+    downloadManager.setCallbacks({onError});
+    await downloadManager.startDownload(hfFileModel, '/path/to/model.bin');
+    const [, emitFailure] = mockEventEmitter.addListener.mock.calls.find(
+      ([name]: [string]) => name === 'onDownloadFailed',
+    );
+
+    const fallbackFailure = emitFailure({
+      downloadId: 'mirror-download',
+      error: 'mirror failed',
+    });
+    await downloadManager.cancelDownload('model-1');
+    resolveFallback({downloadId: 'official-download'});
+    await fallbackFailure;
+
+    expect(NativeModules.DownloadModule.cancelDownload).toHaveBeenNthCalledWith(
+      1,
+      'mirror-download',
+    );
+    expect(NativeModules.DownloadModule.cancelDownload).toHaveBeenNthCalledWith(
+      2,
+      'official-download',
+    );
+    expect(onError).not.toHaveBeenCalled();
+    expect(downloadManager.isDownloading('model-1')).toBe(false);
+  });
+
+  it('reports an official failure with a reused ID while fallback starts', async () => {
+    let resolveFallback: (response: {downloadId: string}) => void = () => {};
+    const fallbackResponse = new Promise<{downloadId: string}>(resolve => {
+      resolveFallback = resolve;
+    });
+    NativeModules.DownloadModule.startDownload
+      .mockResolvedValueOnce({downloadId: 'shared-download'})
+      .mockReturnValueOnce(fallbackResponse);
+    const onError = jest.fn();
+    downloadManager.setCallbacks({onError});
+    await downloadManager.startDownload(hfFileModel, '/path/to/model.bin');
+    const [, emitFailure] = mockEventEmitter.addListener.mock.calls.find(
+      ([name]: [string]) => name === 'onDownloadFailed',
+    );
+
+    const fallbackStart = emitFailure({
+      downloadId: 'shared-download',
+      url: hfMirrorUrl,
+      error: 'mirror failed',
+    });
+    await emitFailure({
+      downloadId: 'shared-download',
+      url: hfFileModel.downloadUrl,
+      error: 'official failed',
+      progress: 25,
+    });
+
+    expect(onError).toHaveBeenCalledWith(
+      'model-1',
+      expect.objectContaining({message: 'official failed'}),
+      25,
+    );
+    expect(downloadManager.isDownloading('model-1')).toBe(false);
+
+    resolveFallback({downloadId: 'shared-download'});
+    await fallbackStart;
+  });
+
+  it('ignores stale mirror events after Android reuses the download ID', async () => {
+    NativeModules.DownloadModule.startDownload.mockResolvedValue({
+      downloadId: 'shared-download',
+    });
+    const callbacks = {
+      onProgress: jest.fn(),
+      onComplete: jest.fn(),
+      onError: jest.fn(),
+    };
+    downloadManager.setCallbacks(callbacks);
+    await downloadManager.startDownload(hfFileModel, '/path/to/model.bin');
+    const [, emitFailure] = mockEventEmitter.addListener.mock.calls.find(
+      ([name]: [string]) => name === 'onDownloadFailed',
+    );
+    const [, emitComplete] = mockEventEmitter.addListener.mock.calls.find(
+      ([name]: [string]) => name === 'onDownloadComplete',
+    );
+    const [, emitProgress] = mockEventEmitter.addListener.mock.calls.find(
+      ([name]: [string]) => name === 'onDownloadProgress',
+    );
+    await emitFailure({
+      downloadId: 'shared-download',
+      url: hfMirrorUrl,
+      error: 'mirror failed',
+    });
+
+    emitProgress({
+      downloadId: 'shared-download',
+      url: hfMirrorUrl,
+      bytesWritten: 100,
+      totalBytes: 1000,
+      progress: 10,
+    });
+    emitComplete({
+      downloadId: 'shared-download',
+      url: hfMirrorUrl,
+      filePath: '/path/to/model.bin',
+    });
+    await emitFailure({
+      downloadId: 'shared-download',
+      url: hfMirrorUrl,
+      error: 'late mirror failure',
+    });
+
+    expect(callbacks.onProgress).not.toHaveBeenCalled();
+    expect(callbacks.onComplete).not.toHaveBeenCalled();
+    expect(callbacks.onError).not.toHaveBeenCalled();
+    expect(downloadManager.isDownloading('model-1')).toBe(true);
+
+    emitComplete({
+      downloadId: 'shared-download',
+      url: hfFileModel.downloadUrl,
+      filePath: '/path/to/model.bin',
+    });
+    expect(callbacks.onComplete).toHaveBeenCalledWith('model-1');
+    expect(downloadManager.isDownloading('model-1')).toBe(false);
+  });
+
   it('asks for notification permission before starting on Android', async () => {
     const order: string[] = [];
     (ensureNotificationPermission as jest.Mock).mockImplementation(async () => {
@@ -175,6 +488,62 @@ describe('DownloadManager', () => {
 
     expect(callbacks.onComplete).toHaveBeenCalledWith('model-1');
     expect(downloadManager.isDownloading('model-1')).toBe(false);
+  });
+
+  it('falls back from the mirror to HF on iOS without mixing partial data', async () => {
+    (Platform as any).OS = 'ios';
+    const iosDownloadManager = new DownloadManager();
+    const callbacks = {onError: jest.fn(), onComplete: jest.fn()};
+    iosDownloadManager.setCallbacks(callbacks);
+    (RNFS.downloadFile as jest.Mock)
+      .mockReturnValueOnce({
+        jobId: 100,
+        promise: Promise.resolve({statusCode: 404}),
+      })
+      .mockReturnValueOnce({
+        jobId: 101,
+        promise: Promise.resolve({statusCode: 200}),
+      });
+
+    await iosDownloadManager.startDownload(hfFileModel, '/path/to/model.bin');
+
+    expect(RNFS.downloadFile).toHaveBeenCalledTimes(2);
+    expect((RNFS.downloadFile as jest.Mock).mock.calls[0][0].fromUrl).toBe(
+      hfMirrorUrl,
+    );
+    expect((RNFS.downloadFile as jest.Mock).mock.calls[1][0].fromUrl).toBe(
+      hfFileModel.downloadUrl,
+    );
+    expect(RNFS.unlink).toHaveBeenCalledWith('/path/to/model.bin');
+    expect(callbacks.onError).not.toHaveBeenCalled();
+    expect(callbacks.onComplete).toHaveBeenCalledWith('model-1');
+  });
+
+  it('reports the official iOS failure after both sources fail', async () => {
+    (Platform as any).OS = 'ios';
+    const iosDownloadManager = new DownloadManager();
+    const onError = jest.fn();
+    iosDownloadManager.setCallbacks({onError});
+    (RNFS.downloadFile as jest.Mock)
+      .mockReturnValueOnce({
+        jobId: 102,
+        promise: Promise.reject(new Error('mirror unavailable')),
+      })
+      .mockReturnValueOnce({
+        jobId: 103,
+        promise: Promise.reject(new Error('official unavailable')),
+      });
+
+    await expect(
+      iosDownloadManager.startDownload(hfFileModel, '/path/to/model.bin'),
+    ).rejects.toThrow('official unavailable');
+
+    expect(RNFS.downloadFile).toHaveBeenCalledTimes(2);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(
+      'model-1',
+      expect.objectContaining({message: 'official unavailable'}),
+    );
   });
 
   it('cancels a download', async () => {
@@ -331,6 +700,9 @@ describe('DownloadManager', () => {
         progress: 0,
       }),
     );
+    expect(iosDownloadManager.activeJobs[0].state.progress).toEqual(
+      expect.objectContaining({bytesTotal: 1000000, progress: 0}),
+    );
 
     // Reset mock to check next call
     callbacks.onProgress.mockClear();
@@ -349,6 +721,10 @@ describe('DownloadManager', () => {
         progress: 50,
       }),
     );
+    expect(iosDownloadManager.activeJobs[0].state.progress).toEqual(
+      expect.objectContaining({bytesDownloaded: 500000, progress: 50}),
+    );
+    expect(iosDownloadManager.getDownloadProgress('model-1')).toBe(50);
 
     // Wait for the download promise to resolve
     await downloadPromise;
@@ -361,6 +737,7 @@ describe('DownloadManager', () => {
     // Set platform to iOS
     (Platform as any).OS = 'ios';
 
+    // Create a new instance for iOS testing
     const iosDownloadManager = new DownloadManager();
 
     const callbacks = {
@@ -417,7 +794,7 @@ describe('DownloadManager', () => {
     });
 
     const startPromise = iosDownloadManager.startDownload(
-      basicModel,
+      hfFileModel,
       '/path/to/model.bin',
     );
 
@@ -435,6 +812,7 @@ describe('DownloadManager', () => {
     await expect(startPromise).rejects.toBeInstanceOf(DownloadCancelledError);
 
     expect(callbacks.onError).not.toHaveBeenCalled();
+    expect(RNFS.downloadFile).toHaveBeenCalledTimes(1);
     expect(iosDownloadManager.isDownloading('model-1')).toBe(false);
   });
 
@@ -564,13 +942,15 @@ describe('DownloadManager', () => {
     });
 
     await iosDownloadManager.startDownload(
-      basicModel,
+      hfFileModel,
       '/path/to/model.bin',
       'secret-token',
     );
 
+    expect(RNFS.downloadFile).toHaveBeenCalledTimes(1);
     expect(RNFS.downloadFile).toHaveBeenCalledWith(
       expect.objectContaining({
+        fromUrl: hfFileModel.downloadUrl,
         headers: expect.objectContaining({
           Authorization: 'Bearer secret-token',
         }),
@@ -606,8 +986,9 @@ describe('DownloadManager', () => {
       'secret-token',
     );
 
-    const headers = (RNFS.downloadFile as jest.Mock).mock.calls[0][0].headers;
-    expect(headers.Authorization).toBeUndefined();
+    const options = (RNFS.downloadFile as jest.Mock).mock.calls[0][0];
+    expect(options.fromUrl).toBe(offHostModel.downloadUrl);
+    expect(options.headers.Authorization).toBeUndefined();
   });
 
   it('does not forward the HF auth token to the native module for a non-HF URL (Android)', async () => {
@@ -627,6 +1008,10 @@ describe('DownloadManager', () => {
       'secret-token',
     );
 
+    expect(NativeModules.DownloadModule.startDownload).toHaveBeenCalledWith(
+      offHostModel.downloadUrl,
+      expect.any(Object),
+    );
     const config = NativeModules.DownloadModule.startDownload.mock.calls[0][1];
     expect(config.authToken).toBeUndefined();
   });
